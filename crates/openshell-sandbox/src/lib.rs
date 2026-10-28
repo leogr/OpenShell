@@ -73,7 +73,22 @@ pub fn run(
     config_path: &std::path::Path,
     qualification: RuntimeQualification,
 ) -> miette::Result<()> {
-    boundary_server::run_boundary(config_path, qualification)
+    run_with(config_path, qualification, true)
+}
+
+/// Run the boundary with workload network mediation on or off. Off is the
+/// fork's unmediated network (`--unmediated-network`): no network syscall is
+/// forwarded, every other boundary layer stays.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_with(
+    config_path: &std::path::Path,
+    qualification: RuntimeQualification,
+    mediate_network: bool,
+) -> miette::Result<()> {
+    boundary_server::run_boundary(config_path, qualification, mediate_network)
         .map_err(|error| miette::miette!(error))
 }
 

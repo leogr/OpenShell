@@ -236,6 +236,7 @@ mod linux {
     pub fn run_boundary(
         config_path: &Path,
         qualification: crate::RuntimeQualification,
+        mediate_network: bool,
     ) -> Result<(), String> {
         install_boundary_signal_handlers()?;
         make_boundary_nondumpable()?;
@@ -266,7 +267,14 @@ mod linux {
         }
         crate::managed_children::start_orphan_reaper()
             .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
-        let (launcher, listener) = crate::linux::workload_launcher::start()
+        if !mediate_network {
+            tracing::warn!(
+                "network mediation is off (--unmediated-network): workload sockets use the \
+                 workload network namespace directly, without policy, L7 inspection or OCSF \
+                 network events"
+            );
+        }
+        let (launcher, listener) = crate::linux::workload_launcher::start_with(mediate_network)
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
@@ -10037,14 +10045,16 @@ mod linux {
 pub fn run_boundary(
     config_path: &Path,
     qualification: crate::RuntimeQualification,
+    mediate_network: bool,
 ) -> Result<(), String> {
-    linux::run_boundary(config_path, qualification)
+    linux::run_boundary(config_path, qualification, mediate_network)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn run_boundary(
     _config_path: &Path,
     _qualification: crate::RuntimeQualification,
+    _mediate_network: bool,
 ) -> Result<(), String> {
     Err("boundary mode is supported only on Linux".to_string())
 }

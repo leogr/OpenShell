@@ -57,7 +57,16 @@ struct BoundaryArgs {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
+
+    /// Do not mediate workload network syscalls: sockets use the workload's
+    /// network namespace directly, without policy. Every other boundary
+    /// layer stays.
+    #[arg(long)]
+    unmediated_network: bool,
 }
+
+/// The flag `launch-capability-free` and the plain boundary share.
+const UNMEDIATED_NETWORK_FLAG: &str = "--unmediated-network";
 
 /// Run the active Phase 0 probe inside the exact workload runtime profile.
 #[cfg(target_os = "linux")]
@@ -1405,14 +1414,16 @@ fn launch_capability_probe(_args: &[String]) -> Result<()> {
 fn launch_capability_free(args: &[String]) -> Result<()> {
     use miette::{Context as _, IntoDiagnostic as _};
 
+    let unmediated_network = args.first().map(String::as_str) == Some(UNMEDIATED_NETWORK_FLAG);
+    let args = if unmediated_network { &args[1..] } else { args };
     let [uid, gid, bootstrap, workspace @ ..] = args else {
         return Err(miette::miette!(
-            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} <UID> <GID> <BOOTSTRAP> [WORKSPACE]"
+            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} [{UNMEDIATED_NETWORK_FLAG}] <UID> <GID> <BOOTSTRAP> [WORKSPACE]"
         ));
     };
     if workspace.len() > 1 {
         return Err(miette::miette!(
-            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} <UID> <GID> <BOOTSTRAP> [WORKSPACE]"
+            "usage: openshell-sandbox {CAPABILITY_FREE_LAUNCH_SUBCOMMAND} [{UNMEDIATED_NETWORK_FLAG}] <UID> <GID> <BOOTSTRAP> [WORKSPACE]"
         ));
     }
     let uid = uid.parse::<u32>().into_diagnostic().wrap_err("parse UID")?;
@@ -1439,7 +1450,7 @@ fn launch_capability_free(args: &[String]) -> Result<()> {
     enter_capability_free_identity(uid, gid)?;
     let log_level = std::env::var(openshell_core::sandbox_env::LOG_LEVEL)
         .unwrap_or_else(|_| "warn".to_string());
-    run_boundary(Path::new(bootstrap), &log_level)
+    run_boundary(Path::new(bootstrap), &log_level, unmediated_network)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1758,7 +1769,7 @@ fn seed_kubernetes_workspace() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+fn run_boundary(bootstrap: &Path, log_level: &str, unmediated_network: bool) -> Result<()> {
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
@@ -1771,11 +1782,11 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
         )
         .try_init();
     let (qualification, _) = qualify_runtime()?;
-    openshell_sandbox::run(bootstrap, qualification)
+    openshell_sandbox::run_with(bootstrap, qualification, !unmediated_network)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_boundary(_bootstrap: &Path, _log_level: &str) -> Result<()> {
+fn run_boundary(_bootstrap: &Path, _log_level: &str, _unmediated_network: bool) -> Result<()> {
     Err(miette::miette!("openshell-sandbox requires Linux"))
 }
 
@@ -1820,13 +1831,28 @@ fn main() -> Result<()> {
     }
 
     let args = BoundaryArgs::parse();
-    run_boundary(&args.bootstrap, &args.log_level)
+    run_boundary(&args.bootstrap, &args.log_level, args.unmediated_network)
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn unmediated_network_is_an_explicit_boundary_flag() {
+        let default = BoundaryArgs::try_parse_from(["openshell-sandbox", "--bootstrap", "/b.json"])
+            .expect("parse default boundary args");
+        assert!(!default.unmediated_network);
+        let unmediated = BoundaryArgs::try_parse_from([
+            "openshell-sandbox",
+            "--bootstrap",
+            "/b.json",
+            UNMEDIATED_NETWORK_FLAG,
+        ])
+        .expect("parse unmediated boundary args");
+        assert!(unmediated.unmediated_network);
+    }
 
     #[test]
     fn kubernetes_bootstrap_stages_private_memory_bundle() {

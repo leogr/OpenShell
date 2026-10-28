@@ -322,25 +322,44 @@ pub fn install_listener(syscalls: &[i64]) -> io::Result<NotificationListener> {
     install_notification_filter(syscalls)
 }
 
-/// Install the capability-free workload networking listener on the calling
-/// launcher thread.
+/// The network syscalls the workload listener forwards to the broker.
+const WORKLOAD_NETWORK_SYSCALLS: [i64; 8] = [
+    libc::SYS_socket,
+    libc::SYS_connect,
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_sendto,
+    libc::SYS_sendmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_setsockopt,
+];
+
+/// Install the capability-free workload listener on the calling launcher
+/// thread.
 ///
-/// The filter mediates every syscall that can create, select, or materially
-/// reconfigure an INET endpoint. Connected `send()`/null-destination
-/// `sendto()` retains the audited cBPF fast path. `accept`/`accept4` run
-/// natively: the broker binds every INET socket to loopback before injecting
-/// it, and accepted sockets inherit their listener's binding.
-pub fn install_workload_listener() -> io::Result<NotificationListener> {
-    #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
-    let mut syscalls = vec![
-        libc::SYS_socket,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_sendto,
-        libc::SYS_sendmsg,
-        libc::SYS_sendmmsg,
-        libc::SYS_setsockopt,
+/// With network mediation on, the filter mediates every syscall that can
+/// create, select, or materially reconfigure an INET endpoint. Connected
+/// `send()`/null-destination `sendto()` retains the audited cBPF fast path.
+/// `accept`/`accept4` run natively: the broker binds every INET socket to
+/// loopback before injecting it, and accepted sockets inherit their
+/// listener's binding.
+///
+/// With `mediate_network` false the eight network syscalls are not forwarded:
+/// the kernel handles workload sockets directly in the workload's network
+/// namespace (yoloctl's unconfined network). Signal and `openat` mediation,
+/// Landlock, the main seccomp filter and the capability-free identity are
+/// unchanged.
+pub fn install_workload_listener_with(mediate_network: bool) -> io::Result<NotificationListener> {
+    install_listener(&workload_listener_syscalls(mediate_network))
+}
+
+/// The syscalls the workload listener forwards.
+pub(crate) fn workload_listener_syscalls(mediate_network: bool) -> Vec<i64> {
+    let mut syscalls = Vec::with_capacity(16);
+    if mediate_network {
+        syscalls.extend_from_slice(&WORKLOAD_NETWORK_SYSCALLS);
+    }
+    syscalls.extend_from_slice(&[
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,
@@ -348,10 +367,10 @@ pub fn install_workload_listener() -> io::Result<NotificationListener> {
         libc::SYS_rt_sigqueueinfo,
         libc::SYS_openat,
         libc::SYS_openat2,
-    ];
+    ]);
     #[cfg(target_arch = "x86_64")]
     syscalls.push(libc::SYS_open);
-    install_listener(&syscalls)
+    syscalls
 }
 
 /// Run a no-capability conformance probe.
@@ -854,6 +873,52 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn workload_listener_forwards_network_syscalls_only_when_mediating() {
+        // The mediated list is upstream's, unchanged and in order.
+        #[allow(unused_mut)] // SYS_open is unavailable on some architectures.
+        let mut upstream = vec![
+            libc::SYS_socket,
+            libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_sendto,
+            libc::SYS_sendmsg,
+            libc::SYS_sendmmsg,
+            libc::SYS_setsockopt,
+            libc::SYS_kill,
+            libc::SYS_tkill,
+            libc::SYS_tgkill,
+            libc::SYS_rt_tgsigqueueinfo,
+            libc::SYS_rt_sigqueueinfo,
+            libc::SYS_openat,
+            libc::SYS_openat2,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        upstream.push(libc::SYS_open);
+        assert_eq!(workload_listener_syscalls(true), upstream);
+
+        // Unmediated drops exactly the eight network syscalls; signal and
+        // openat mediation stay.
+        let unmediated = workload_listener_syscalls(false);
+        let expected: Vec<i64> = upstream
+            .into_iter()
+            .filter(|syscall| !WORKLOAD_NETWORK_SYSCALLS.contains(syscall))
+            .collect();
+        assert_eq!(unmediated, expected);
+        for syscall in WORKLOAD_NETWORK_SYSCALLS {
+            assert!(!unmediated.contains(&syscall));
+        }
+        for syscall in [
+            libc::SYS_kill,
+            libc::SYS_tgkill,
+            libc::SYS_openat,
+            libc::SYS_openat2,
+        ] {
+            assert!(unmediated.contains(&syscall));
+        }
+    }
 
     const NONDUMPABLE_PROBE_CHILD: &str = "OPENSHELL_NONDUMPABLE_PROBE_CHILD";
     const REJECTED_INSTALL_PROBE_CHILD: &str = "OPENSHELL_REJECTED_INSTALL_PROBE_CHILD";
